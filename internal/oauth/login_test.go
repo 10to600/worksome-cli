@@ -3,6 +3,7 @@ package oauth
 import (
 	"bytes"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -79,5 +80,41 @@ func TestLoginWithoutClientIDFailsBeforeAnything(t *testing.T) {
 	_, err := Login(context.Background(), Config{}, nil, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "client id") {
 		t.Errorf("error = %v", err)
+	}
+}
+
+// --no-browser passes a nil opener. Nothing is attempted, so the output must
+// neither announce a browser nor report that one failed to open.
+func TestLoginWithoutBrowserClaimsNothing(t *testing.T) {
+	// A plain net.Listener releases its port synchronously on Close, so the
+	// redirect port is reliably free for Login to bind.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirect := "http://" + probe.Addr().String() + "/callback"
+	_ = probe.Close()
+
+	cfg := Config{ClientID: "cli", AuthorizeURL: "https://use.example.test/oauth/authorize", TokenURL: "https://use.example.test/oauth/token", RedirectURL: redirect}
+
+	var out bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err = Login(ctx, cfg, nil, &out)
+	if err == nil {
+		t.Fatal("expected the login to time out waiting for approval")
+	}
+	if !strings.Contains(err.Error(), "deadline") && !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("Login() error = %v", err)
+	}
+
+	text := out.String()
+	for _, bad := range []string{"Opening your browser", "Could not open"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("--no-browser output must not contain %q, got:\n%s", bad, text)
+		}
+	}
+	if !strings.Contains(text, "Visit this URL") || !strings.Contains(text, "/oauth/authorize?") {
+		t.Errorf("--no-browser output must print the consent URL, got:\n%s", text)
 	}
 }

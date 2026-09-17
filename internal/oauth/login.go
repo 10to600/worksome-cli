@@ -36,10 +36,15 @@ func Login(ctx context.Context, cfg Config, open func(url string) error, out io.
 		return Token{}, err
 	}
 
-	_, _ = fmt.Fprintln(out, "Opening your browser to sign in to Worksome and approve access…")
-	if open == nil || open(consentURL) != nil {
+	switch {
+	case open == nil:
+		// --no-browser: nothing is attempted, so claim nothing.
+		_, _ = fmt.Fprintln(out, "Visit this URL to sign in to Worksome and approve access:")
+	case open(consentURL) != nil:
+		_, _ = fmt.Fprintln(out, "Opening your browser to sign in to Worksome and approve access…")
 		_, _ = fmt.Fprintln(out, "Could not open a browser. Visit this URL to continue:")
-	} else {
+	default:
+		_, _ = fmt.Fprintln(out, "Opening your browser to sign in to Worksome and approve access…")
 		_, _ = fmt.Fprintln(out, "If the browser did not open, visit:")
 	}
 	_, _ = fmt.Fprintf(out, "  %s\n", consentURL)

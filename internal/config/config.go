@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	defaultEndpoint = "https://api.worksome.com/graphql"
+	defaultEndpoint = DefaultEndpoint
 	configDir       = ".worksome"
 	configFile      = "config.yaml"
 	envToken        = "WORKSOME_API_TOKEN"
@@ -231,7 +231,13 @@ func (c *Config) ResolveEndpoint(flagValue string) string {
 	return defaultEndpoint
 }
 
-// MaskToken masks all but the last 4 characters of a token for display.
+// DefaultEndpoint is the production GraphQL endpoint used when nothing else
+// names one.
+const DefaultEndpoint = "https://api.worksome.com/graphql"
+
+// MaskToken masks a token for display as a fixed-width prefix of four stars
+// followed by its last 4 characters, whatever its length. OAuth access tokens
+// run to ~1 KB, so a one-star-per-character mask would swamp the output.
 // Tokens with 4 or fewer characters are fully masked.
 func MaskToken(token string) string {
 	if token == "" {
@@ -242,5 +248,5 @@ func MaskToken(token string) string {
 		return strings.Repeat("*", len(token))
 	}
 
-	return strings.Repeat("*", len(token)-4) + token[len(token)-4:]
+	return "****" + token[len(token)-4:]
 }

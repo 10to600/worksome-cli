@@ -19,6 +19,22 @@ import (
 // loginTimeout bounds how long `auth login` waits for the browser.
 const loginTimeout = 5 * time.Minute
 
+// loginEndpoint picks the API endpoint for `auth login` with the CLI's usual
+// precedence: --endpoint, then WORKSOME_ENDPOINT, then the endpoint already
+// stored on the profile being (re)written, then the production default.
+func loginEndpoint(cfg *config.Config, profileName, flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if v := os.Getenv("WORKSOME_ENDPOINT"); v != "" {
+		return v
+	}
+	if p, ok := cfg.Profiles[profileName]; ok && p.Endpoint != "" {
+		return p.Endpoint
+	}
+	return config.DefaultEndpoint
+}
+
 func newAuthCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "auth",
@@ -85,7 +101,11 @@ Credentials are stored in ~/.worksome/config.yaml with restricted permissions.`,
 			}
 
 			token := tokenFlag
-			endpoint := endpointFlag
+			// Resolve the endpoint the same way every other command does
+			// (flag, WORKSOME_ENDPOINT, then the profile being written), so
+			// signing in against another platform validates against that
+			// platform rather than production.
+			endpoint := loginEndpoint(cfg, profileName, endpointFlag)
 			var session *oauth.Token
 
 			// Browser login is the default when a person is present: no
@@ -138,9 +158,8 @@ Credentials are stored in ~/.worksome/config.yaml with restricted permissions.`,
 					return fmt.Errorf("token cannot be empty")
 				}
 
-				// Prompt for endpoint if not provided via flag
-				if endpoint == "" {
-					endpoint = "https://api.worksome.com/graphql"
+				// Confirm the endpoint unless it was given explicitly
+				if endpointFlag == "" && os.Getenv("WORKSOME_ENDPOINT") == "" {
 					fmt.Fprintf(os.Stderr, "API endpoint [%s]: ", endpoint)
 					line, err := reader.ReadString('\n')
 					if err == nil {
@@ -149,10 +168,6 @@ Credentials are stored in ~/.worksome/config.yaml with restricted permissions.`,
 						}
 					}
 				}
-			}
-
-			if endpoint == "" {
-				endpoint = "https://api.worksome.com/graphql"
 			}
 
 			// Validate token by querying viewer

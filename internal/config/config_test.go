@@ -187,8 +187,9 @@ func TestMaskToken(t *testing.T) {
 		{"", ""},
 		{"ab", "**"},
 		{"abcd", "****"},
-		{"abcde", "*bcde"}, // 5 chars: 1 star + last 4
-		{"super-secret-token-1234", "*******************1234"},
+		{"abcde", "****bcde"}, // fixed 4-star prefix + last 4
+		{"super-secret-token-1234", "****1234"},
+		{strings.Repeat("x", 900) + "QDR8", "****QDR8"}, // OAuth-sized token stays short
 	}
 
 	for _, tc := range tests {
@@ -232,7 +233,7 @@ func TestMaskTokenEdgeCases(t *testing.T) {
 		{"empty string", "", ""},
 		{"3 char fully masked", "abc", "***"},
 		{"4 char fully masked", "abcd", "****"},
-		{"5 char shows last 4", "abcde", "*bcde"},
+		{"5 char shows last 4", "abcde", "****bcde"},
 	}
 
 	for _, tc := range tests {
