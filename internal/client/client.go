@@ -11,11 +11,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -350,6 +352,9 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 		if lastErr != nil {
 			// Don't retry non-transient errors (HTTP status codes, context cancellation).
 			if ctx.Err() != nil {
+				if isMutation && !requestNotSent(lastErr) {
+					return fmt.Errorf("request cancelled (%w); the server may have applied the mutation — read the record before retrying", ctx.Err())
+				}
 				return fmt.Errorf("request cancelled: %w", ctx.Err())
 			}
 			var he *httpError
@@ -424,8 +429,18 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 // errCreatingRequest marks a failure to build the HTTP request, before anything is sent.
 var errCreatingRequest = errors.New("creating request")
 
+// sentError marks a transport failure after a connection was obtained, such as a failed redirect hop.
+type sentError struct{ err error }
+
+func (e *sentError) Error() string { return e.err.Error() }
+func (e *sentError) Unwrap() error { return e.err }
+
 // requestNotSent reports whether err happened before the request could reach the server.
 func requestNotSent(err error) bool {
+	var se *sentError
+	if errors.As(err, &se) {
+		return false
+	}
 	if errors.Is(err, errCreatingRequest) {
 		return true
 	}
@@ -510,8 +525,16 @@ func (c *Client) doRequest(ctx context.Context, payload []byte) ([]byte, error) 
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	SetIdentityHeaders(req, c.userAgent)
 
+	var gotConn atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { gotConn.Store(true) },
+	}))
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		if gotConn.Load() {
+			err = &sentError{err: err}
+		}
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()

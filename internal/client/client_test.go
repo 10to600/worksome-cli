@@ -1125,3 +1125,63 @@ func TestExecute_MutationNotSentOnRequestBuildFailure(t *testing.T) {
 		t.Errorf("error should say the mutation was not sent, got: %v", err)
 	}
 }
+
+// A dial failure on a redirect hop comes after the first request was sent, so it may have applied.
+func TestExecute_MutationRedirectDialFailureMayHaveApplied(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	closedAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	var attempts atomic.Int32
+	srv := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		http.Redirect(w, r, "http://"+closedAddr+"/done", http.StatusSeeOther)
+	})
+	defer srv.Close()
+
+	c := New(srv.URL, "token")
+	err = c.Execute(context.Background(), `mutation { approve(input: {id: "1"}) { id } }`, nil, nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("mutation was sent %d times, want exactly 1", got)
+	}
+	if !strings.Contains(err.Error(), "may have applied") || strings.Contains(err.Error(), "mutation not sent") {
+		t.Errorf("error should tell the caller to re-read before retrying, got: %v", err)
+	}
+}
+
+// A mutation cancelled while waiting for the reply may have applied.
+func TestExecute_MutationCancelledAfterSendMayHaveApplied(t *testing.T) {
+	sent := make(chan struct{})
+	release := make(chan struct{})
+	srv := newTestServer(func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		close(sent)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-sent
+		cancel()
+	}()
+
+	c := New(srv.URL, "token")
+	err := c.Execute(ctx, `mutation { approve(input: {id: "1"}) { id } }`, nil, nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "request cancelled") || !strings.Contains(err.Error(), "may have applied") {
+		t.Errorf("error should tell the caller to re-read before retrying, got: %v", err)
+	}
+}
