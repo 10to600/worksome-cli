@@ -125,8 +125,9 @@ func TestAuthStatusResolvesProfile(t *testing.T) {
 			}
 
 			out := captureStdout(t, func() {
-				if err := runRootCmd(tc.args...); err != nil {
-					t.Errorf("Execute failed: %v", err)
+				// The stub rejects every token, so status must exit non-zero.
+				if err := runRootCmd(tc.args...); err == nil {
+					t.Error("auth status succeeded for a rejected token")
 				}
 			})
 
@@ -226,5 +227,31 @@ func TestAuthLoginShorthandFlags(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "token validation failed") {
 		t.Errorf("expected token validation failure, got: %v", err)
+	}
+}
+
+// Browser sign-in used to validate against production whenever --endpoint was
+// absent, so signing in against another platform failed with "Unauthenticated"
+// even though the token was fine. The endpoint must follow the CLI's usual
+// precedence: flag, WORKSOME_ENDPOINT, the profile being written, default.
+func TestLoginEndpointPrecedence(t *testing.T) {
+	t.Setenv("WORKSOME_ENDPOINT", "")
+	cfg := &config.Config{Profiles: map[string]config.Profile{
+		"stage": {Endpoint: "https://sandbox.example.test/graphql"},
+	}}
+
+	if got := loginEndpoint(cfg, "default", ""); got != config.DefaultEndpoint {
+		t.Errorf("nothing set: got %q, want default", got)
+	}
+	if got := loginEndpoint(cfg, "stage", ""); got != "https://sandbox.example.test/graphql" {
+		t.Errorf("existing profile endpoint ignored: got %q", got)
+	}
+
+	t.Setenv("WORKSOME_ENDPOINT", "https://env.example.test/graphql")
+	if got := loginEndpoint(cfg, "stage", ""); got != "https://env.example.test/graphql" {
+		t.Errorf("WORKSOME_ENDPOINT must beat the stored profile: got %q", got)
+	}
+	if got := loginEndpoint(cfg, "stage", "https://flag.example.test/graphql"); got != "https://flag.example.test/graphql" {
+		t.Errorf("--endpoint must beat everything: got %q", got)
 	}
 }

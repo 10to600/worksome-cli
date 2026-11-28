@@ -55,6 +55,13 @@ their shell profile.
 worksome auth status
 ```
 
+`worksome auth login` takes a Personal Access Token by default. If a person is
+at the keyboard and the browser runs on the same machine as the CLI, they can
+run `worksome auth login --browser` instead: they sign in and approve, and the
+CLI holds a session that renews itself. In a remote sandbox, a container or a
+scheduled job there is no such browser, so a Personal Access Token is the path,
+and the rest of this section is about that.
+
 Token resolution order, and how to satisfy it:
 
 1. **`WORKSOME_API_TOKEN` in the environment** — the intended path. If it is set,
@@ -190,7 +197,11 @@ for us", read `lastPaymentRequestDate` on each hire and set your own window
 
 **Two ledgers, not one.** A *payment request* is what the worker is paid:
 `billedAmount`, `billedAmountWithExpenses`, settled on `paidAt`, state in
-`workerPayoutStatus`. An *invoice* is what the company pays Worksome:
+`workerPayoutStatus`. What the company pays for one, before VAT, is
+`companyNetAmount`: the worker's pay plus Worksome's fee, the employment cost,
+any agency fee and expenses. `companyGrossAmount` adds VAT and
+`companyServiceAmount` is Worksome's fee alone. They are not in the default
+output: name them in `--fields`. An *invoice* is what the company pays Worksome:
 `grossAmount` = `netAmount` + `taxAmount`, outstanding in `grossOpenAmount`,
 settled on `markedPaidAt`. "What did we pay contractors" is payment requests.
 "What do we owe" is invoices. Do not add them together.

@@ -118,6 +118,9 @@ func newRootCmd() *cobra.Command {
 		return []string{"json", "table"}, cobra.ShellCompDirectiveNoFileComp
 	})
 
+	// session is the browser-login profile whose own token the client sends, if any.
+	var session string
+
 	// Set up client factory for generated commands
 	commands.SetClientFactory(func() (*client.Client, error) {
 		cfg, err := config.Load()
@@ -136,11 +139,25 @@ func newRootCmd() *cobra.Command {
 
 		cfg.CurrentProfile = cfg.ResolveProfile(profileFlag)
 
+		// A browser-login session renews itself. Only the profile's own
+		// token is ever refreshed: a token from --token or the environment
+		// belongs to whoever put it there.
+		if tokenFlag == "" && os.Getenv("WORKSOME_API_TOKEN") == "" {
+			if p, ok := cfg.ActiveProfile(); ok && p.IsOAuth() {
+				if err := useSession(context.Background(), cfg, cfg.CurrentProfile); err != nil {
+					return nil, err
+				}
+				// Renewal reloads the profile, so judge the session by the one the request will use.
+				p, _ = cfg.ActiveProfile()
+				session = sessionFor(cfg.CurrentProfile, p, cfg.ResolveEndpoint(endpointFlag))
+			}
+		}
+
 		token := cfg.ResolveToken(tokenFlag)
 		endpoint := cfg.ResolveEndpoint(endpointFlag)
 
 		if token == "" {
-			return nil, fmt.Errorf("no API token configured. Run 'worksome auth login' to set up authentication")
+			return nil, fmt.Errorf("no credentials configured. Run 'worksome auth login' to sign in")
 		}
 
 		verbose, _ := rootCmd.PersistentFlags().GetBool("verbose")
@@ -178,6 +195,7 @@ func newRootCmd() *cobra.Command {
 
 	// Register all generated resource commands
 	commands.RegisterAll(rootCmd)
+	explainEndedSessions(rootCmd, &session)
 
 	// Assign groups to commands based on name
 	coreResources := map[string]bool{

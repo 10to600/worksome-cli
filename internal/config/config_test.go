@@ -1,10 +1,13 @@
 package config
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadSaveRoundTrip(t *testing.T) {
@@ -186,8 +189,9 @@ func TestMaskToken(t *testing.T) {
 		{"", ""},
 		{"ab", "**"},
 		{"abcd", "****"},
-		{"abcde", "*bcde"}, // 5 chars: 1 star + last 4
-		{"super-secret-token-1234", "*******************1234"},
+		{"abcde", "****bcde"}, // fixed 4-star prefix + last 4
+		{"super-secret-token-1234", "****1234"},
+		{strings.Repeat("x", 900) + "QDR8", "****QDR8"}, // OAuth-sized token stays short
 	}
 
 	for _, tc := range tests {
@@ -231,7 +235,7 @@ func TestMaskTokenEdgeCases(t *testing.T) {
 		{"empty string", "", ""},
 		{"3 char fully masked", "abc", "***"},
 		{"4 char fully masked", "abcd", "****"},
-		{"5 char shows last 4", "abcde", "*bcde"},
+		{"5 char shows last 4", "abcde", "****bcde"},
 	}
 
 	for _, tc := range tests {
@@ -462,5 +466,322 @@ func TestLoadDoesNotCreateConfigDirectory(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(home, configDir)); !os.IsNotExist(err) {
 		t.Errorf("Load created %s; it must only be created when saving", configDir)
+	}
+}
+
+func TestProfileSessionRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	expires := time.Date(2026, 9, 26, 10, 30, 0, 0, time.FixedZone("CEST", 2*3600))
+	var p Profile
+	p.Endpoint = "https://api.example.test/graphql"
+	p.SetSession("acc", "ref", expires)
+
+	cfg := &Config{CurrentProfile: "default", Profiles: map[string]Profile{"default": p}}
+	if err := cfg.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Profiles["default"]
+	if !got.IsOAuth() || got.Token != "acc" || got.RefreshToken != "ref" {
+		t.Errorf("loaded profile = %+v", got)
+	}
+	exp, ok := got.Expiry()
+	if !ok || !exp.Equal(expires) {
+		t.Errorf("Expiry() = %v, %v; want %v", exp, ok, expires)
+	}
+	if got.ExpiresAt != "2026-09-26T08:30:00Z" {
+		t.Errorf("expiry should be stored in UTC RFC 3339, got %q", got.ExpiresAt)
+	}
+
+	// A personal access token profile has no session fields and is not OAuth.
+	pat := Profile{Token: "pat"}
+	if pat.IsOAuth() {
+		t.Error("a PAT profile must not report as OAuth")
+	}
+	if _, ok := pat.Expiry(); ok {
+		t.Error("a PAT profile has no expiry")
+	}
+}
+
+// A config left with a wider mode must come out 0600 after a save.
+func TestSaveTightensExistingFilePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("profiles: {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{Profiles: map[string]Profile{"default": {Token: "secret"}}}
+	if err := cfg.SaveTo(path); err != nil {
+		t.Fatalf("SaveTo failed: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Errorf("file permissions = %o, want 0600", perm)
+	}
+}
+
+// Renewal saves during ordinary commands, so a parallel command must never read half a file: a save replaces the file, never rewrites it in place.
+func TestSaveReplacesTheFileInsteadOfRewritingIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not rename over a file another handle holds open")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := (&Config{Profiles: map[string]Profile{"old": {Token: "old-token"}}}).SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	if err := (&Config{Profiles: map[string]Profile{"new": {Token: "new-token"}}}).SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(before), "old-token") || strings.Contains(string(before), "new-token") {
+		t.Errorf("a reader that opened the file before the save read %q; the old file must stay whole", before)
+	}
+	after, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Profiles["new"].Token != "new-token" {
+		t.Errorf("config after save = %+v", after)
+	}
+}
+
+// A config symlinked from elsewhere, such as dotfiles, must stay a link and its target must get the new content.
+func TestSaveFollowsASymlinkedConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks needs extra privileges on Windows")
+	}
+	symlink := func(t *testing.T, target, link string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name string
+		// setup links a config path to target and returns the config path.
+		setup func(t *testing.T, target string) string
+	}{
+		{"absolute link", func(t *testing.T, target string) string {
+			link := filepath.Join(t.TempDir(), ".worksome", "config.yaml")
+			symlink(t, target, link)
+			return link
+		}},
+		{"relative link in a symlinked directory", func(t *testing.T, target string) string {
+			// From the real directory "../" reaches target; from the link's directory it does not.
+			realDir := filepath.Join(filepath.Dir(target), "conf")
+			symlink(t, "../"+filepath.Base(target), filepath.Join(realDir, "config.yaml"))
+			dir := filepath.Join(t.TempDir(), "links", ".worksome")
+			symlink(t, realDir, dir)
+			return filepath.Join(dir, "config.yaml")
+		}},
+		{"link through a symlinked component", func(t *testing.T, target string) string {
+			// "hop/.." must leave the directory hop points to, not hop's own directory.
+			nested := filepath.Join(filepath.Dir(target), "nested")
+			if err := os.MkdirAll(nested, 0700); err != nil {
+				t.Fatal(err)
+			}
+			settings := filepath.Join(t.TempDir(), "settings")
+			symlink(t, nested, filepath.Join(settings, "hop"))
+			link := filepath.Join(settings, "config.yaml")
+			symlink(t, "hop/../"+filepath.Base(target), link)
+			return link
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "dotfiles", "worksome.yaml")
+			if err := (&Config{Profiles: map[string]Profile{"old": {Token: "old-token"}}}).SaveTo(target); err != nil {
+				t.Fatal(err)
+			}
+			link := tt.setup(t, target)
+
+			if err := (&Config{Profiles: map[string]Profile{"new": {Token: "new-token"}}}).SaveTo(link); err != nil {
+				t.Fatal(err)
+			}
+
+			info, err := os.Lstat(link)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				t.Error("the save replaced the symlink with a regular file")
+			}
+			got, err := LoadFrom(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Profiles["new"].Token != "new-token" {
+				t.Errorf("link target after save = %+v, want the new config", got)
+			}
+		})
+	}
+}
+
+// A link to a missing file is refused rather than guessed at, so the link survives and no other file is written.
+func TestSaveRefusesADanglingConfigSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symlinks needs extra privileges on Windows")
+	}
+	link := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "missing.yaml"), link); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (&Config{Profiles: map[string]Profile{"new": {Token: "new-token"}}}).SaveTo(link)
+	if err == nil || !strings.Contains(err.Error(), "symlink to a missing file") {
+		t.Errorf("SaveTo() error = %v, want the dangling link named", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("the dangling link must survive, Lstat = %v, %v", info, err)
+	}
+}
+
+func TestSaveCreatesAPrivateDirectoryAndLeavesNoTempFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested")
+	path := filepath.Join(dir, "config.yaml")
+	cfg := &Config{Profiles: map[string]Profile{"default": {Token: "secret"}}}
+	for range 3 {
+		if err := cfg.SaveTo(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "config.yaml" {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("directory holds %v, want only config.yaml", names)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Windows reports 0777 for any writable directory.
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0700 {
+		t.Errorf("directory permissions = %o, want 0700", perm)
+	}
+}
+
+func TestProfileStoresOAuthIssuer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := &Config{Profiles: map[string]Profile{
+		"stage": {Token: "a", RefreshToken: "r", OAuthTokenURL: "https://stage.example.test/oauth/token", OAuthClientID: "cid"},
+		"pat":   {Token: "p"},
+	}}
+	if err := cfg.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Profiles["stage"]; got.OAuthTokenURL != "https://stage.example.test/oauth/token" || got.OAuthClientID != "cid" {
+		t.Errorf("OAuth issuer not round-tripped: %+v", got)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(data), "oauth_token_url") != 1 {
+		t.Errorf("a PAT profile must not carry empty OAuth fields:\n%s", data)
+	}
+}
+
+func TestLockIsExclusive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.lock")
+	unlock, err := LockAt(path)
+	if err != nil {
+		t.Fatalf("LockAt: %v", err)
+	}
+
+	acquired := make(chan struct{})
+	go func() {
+		second, err := LockAt(path)
+		if err != nil {
+			t.Errorf("second LockAt: %v", err)
+			close(acquired)
+			return
+		}
+		close(acquired)
+		second()
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("a second lock was granted while the first was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second lock was not granted after release")
+	}
+}
+
+// A writer that loaded earlier must not restore a refresh token another process has since rotated.
+func TestUpdateWorksOnTheCurrentFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	initial := &Config{Profiles: map[string]Profile{"stage": {Token: "a", RefreshToken: "ref-0"}}}
+	if err := initial.Save(); err != nil {
+		t.Fatal(err)
+	}
+	rotated := &Config{Profiles: map[string]Profile{"stage": {Token: "b", RefreshToken: "ref-1"}}}
+	if err := rotated.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Update(func(c *Config) error {
+		c.Profiles["new"] = Profile{Token: "n"}
+		c.CurrentProfile = "new"
+		return nil
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Profiles["stage"].RefreshToken != "ref-1" || got.Profiles["new"].Token != "n" || got.CurrentProfile != "new" {
+		t.Errorf("config after Update = %+v", got)
+	}
+
+	if err := Update(func(c *Config) error { return os.ErrNotExist }); err != os.ErrNotExist {
+		t.Errorf("Update must return fn's error as is, got %v", err)
 	}
 }

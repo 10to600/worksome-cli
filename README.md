@@ -1,6 +1,6 @@
 # worksome-cli
 
-A multiplatform CLI for the [Worksome GraphQL API](https://docs.worksome.com/). Full API coverage via code generation from a vendored schema — <!-- resources -->104<!-- /resources --> resource groups, <!-- operations -->229<!-- /operations --> operations. Designed for both human users and AI agents.
+A multiplatform CLI for the [Worksome GraphQL API](https://docs.worksome.com/). Full API coverage via code generation from a vendored schema — <!-- resources -->109<!-- /resources --> resource groups, <!-- operations -->234<!-- /operations --> operations. Designed for both human users and AI agents.
 
 ## What is Worksome?
 
@@ -88,7 +88,7 @@ tokens last six months and one token works on any number of machines.
 
 The CLI is designed to be driven programmatically:
 
-- **Discovery is built in.** `worksome --help` lists all <!-- resources -->104<!-- /resources --> resource groups; `worksome <resource> --help` lists that resource's actions. All help text is generated from the GraphQL schema, so it cannot drift from the API.
+- **Discovery is built in.** `worksome --help` lists all <!-- resources -->109<!-- /resources --> resource groups; `worksome <resource> --help` lists that resource's actions. All help text is generated from the GraphQL schema, so it cannot drift from the API.
 - **Permissions are documented per action.** Many operations are restricted to one party — company, worker, or recruiter — and the help text says so (e.g. "Only companies can cancel their hires"). A permission error is usually a correct answer about the token's role, not a bug to work around.
 - **JSON without asking.** Output is JSON whenever stdout is not a TTY, so pipelines need no `--output json`. Pass it explicitly if you can't be sure of the environment.
 - **Keep responses small.** `--fields id,worker.name` narrows the GraphQL selection set itself — the server is only asked for those fields — and `--filter status=ACTIVE` narrows results. Useful when a full page of objects would be more than you need. A field name that does not exist is an error, not an empty result — except on the few operations whose shape can't be narrowed, where it is still dropped silently.
@@ -200,7 +200,7 @@ no authentication needed.
 ## Quick Start
 
 ```bash
-# Authenticate with a Personal Access Token
+# Sign in with a personal access token (or --browser)
 worksome auth login
 
 # List hires (first page)
@@ -224,19 +224,101 @@ worksome hires list --status ACTIVE | jq '.[].id'
 
 ## Authentication
 
-The CLI uses Personal Access Tokens. Token resolution order:
+`worksome auth login` asks for a **Personal Access Token**. Create one at
+<https://use.worksome.com/integrations/api-tokens> (six-month lifetime, shown
+once) and hand it over any of these ways:
+
+```bash
+worksome auth login                      # prompted, input hidden
+worksome auth login --token <token>      # saved to a profile
+echo "<token>" | worksome auth login     # from stdin
+export WORKSOME_API_TOKEN=<token>        # environment: nothing touches disk
+```
+
+Whatever the source, the token acts as the user it belongs to and sees exactly
+what that user sees in Worksome. A job should run on a service user's token, not
+a person's.
+
+### Browser sign-in
+
+`worksome auth login --browser` opens your browser instead. You sign in to
+Worksome as usual, SSO and MFA included, and approve the CLI. The session renews
+itself while you keep using it and lapses after 90 days without use. Nothing is
+copied or pasted. `auth logout` forgets the session on this machine only (see
+[Managing credentials](#managing-credentials)).
+
+```bash
+worksome auth login --browser      # Sign in through the browser
+worksome auth login --no-browser   # Same, but print the sign-in URL instead of opening a browser
+```
+
+After you approve, Worksome sends the browser to `http://127.0.0.1:51789` on the
+machine that runs the browser, and the CLI must be listening there. The browser
+and the CLI must therefore run on the same machine. If another program holds
+port 51789, the CLI listens on a free port and prints it. Over SSH, forward the
+port first, then open the printed URL in your local browser:
+
+```bash
+ssh -L 51789:127.0.0.1:51789 <host>
+worksome auth login --no-browser
+```
+
+If the CLI prints another port, forward that port instead.
+
+Browser sign-in uses a first-party public OAuth client that the platform
+registers. It signs in on the app host of the profile's endpoint:
+
+| Endpoint host                                         | Signs in at                               |
+|-------------------------------------------------------|-------------------------------------------|
+| `api.worksome.com` (production)                       | `use.worksome.com`                        |
+| `<name>-api.<…>.worksome.com`, e.g. `stage-api.worksome.com` | `<name>.<…>.worksome.com`, e.g. `stage.worksome.com` |
+| any other `*.worksome.com` host                       | the same host                             |
+
+The CLI derives these URLs only for `*.worksome.com` hosts, so a mistyped
+endpoint never receives your session. For any other endpoint, for example a
+local platform, set both `WORKSOME_OAUTH_AUTHORIZE_URL` and
+`WORKSOME_OAUTH_TOKEN_URL`. `WORKSOME_OAUTH_CLIENT_ID` overrides the client.
+
+#### Sandboxes and other non-production platforms
+
+Most sandboxes protect the app host, `/oauth/*` included, with HTTP Basic
+authentication. The browser asks for these credentials on the consent page, but
+the CLI cannot answer that prompt for the token exchange. Put the credentials
+in the token URL; the CLI sends them as Basic authentication:
+
+```bash
+export WORKSOME_OAUTH_TOKEN_URL='https://<user>:<password>@<sandbox>.sand.hz.worksome.com/oauth/token'
+worksome auth login --browser --profile sandbox \
+  --endpoint https://<sandbox>-api.sand.hz.worksome.com/graphql
+```
+
+The profile stores this token URL, credentials included, to renew the session.
+
+### Managing credentials
+
+```bash
+worksome auth status          # Show current auth state; exits non-zero if the token is refused
+worksome auth list            # List configured profiles
+worksome auth switch <name>   # Switch profile
+worksome auth logout [name]   # Forget a profile and its credentials on this machine
+```
+
+`auth logout` does not end a browser session in Worksome: its tokens stay valid
+until they lapse. To end the session everywhere, use **Log out other sessions**
+in Worksome, or change your password. A command on a session that has ended
+says so and names the command that signs in again
+(`worksome auth login --browser --profile <name>`). If Worksome cannot be
+reached to renew a session, the CLI warns and keeps using the current token
+until it expires.
+
+Credential resolution order:
 
 1. `--token` flag
 2. `WORKSOME_API_TOKEN` environment variable
-3. Config file (`~/.worksome/config.yaml`)
+3. The active profile in `~/.worksome/config.yaml` (saved token or browser session)
 
-```bash
-worksome auth login           # Interactive setup
-worksome auth status          # Show current auth state
-worksome auth list            # List configured profiles
-worksome auth switch <name>   # Switch profile
-worksome auth logout [name]   # Remove a profile and its credentials
-```
+Only a profile's own browser session is ever renewed; a token from the flag or
+the environment is used as given.
 
 ### Profiles
 
@@ -374,7 +456,7 @@ internal/
   codegen/          Schema parser + code generator
   config/           Profile and token management
   generated/        Generated code (committed, reviewed)
-    commands/       Cobra commands (<!-- resources -->104<!-- /resources --> resource groups)
+    commands/       Cobra commands (<!-- resources -->109<!-- /resources --> resource groups)
     queries/        GraphQL query/mutation functions
     types/          Go types, enums, input objects
   output/           JSON/table formatter with TTY detection
