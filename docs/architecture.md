@@ -176,7 +176,7 @@ make verify-generated  # CI check: fail if generated code is stale
 | Layer | Tests | Coverage |
 |-------|-------|----------|
 | `internal/codegen/` | Parser IR, generator output, full-schema snapshot | Schema parsing, code generation |
-| `internal/client/` | Mock HTTP server, retries, pagination, auth errors | Network layer |
+| `internal/client/` | Mock HTTP server, query retries, mutations sent once (sent vs not-sent errors), pagination, auth errors | Network layer |
 | `internal/config/` | Load/save round-trip, token precedence, permissions | Configuration |
 | `internal/output/` | JSON/table formatting, TTY detection, field extraction | Output |
 | `test/integration/` | (future) Live API smoke tests | End-to-end |

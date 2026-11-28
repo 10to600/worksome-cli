@@ -1019,11 +1019,7 @@ func TestSetIdentityHeaders(t *testing.T) {
 	}
 }
 
-// A mutation is never retried. The request can reach the server and be
-// committed while only the reply is lost; a second send of `approve` or
-// `createPaymentRequest` is then a second approval or a second payment. The
-// error must say the server may have applied it, so the caller re-reads
-// before deciding to try again. Queries keep the existing retry behaviour.
+// A mutation that may have reached the server is sent once and tells the caller to re-read.
 func TestExecute_NeverRetriesMutations(t *testing.T) {
 	var attempts atomic.Int32
 	srv := newTestServer(func(w http.ResponseWriter, _ *http.Request) {
@@ -1060,5 +1056,72 @@ func TestExecute_NeverRetriesMutations(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("no backoff should be spent on a mutation, took %s", elapsed)
+	}
+}
+
+// A mutation that never left the client is sent once and says it was not sent.
+func TestExecute_MutationNotSentOnDialFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	closedAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	tests := []struct {
+		name string
+		dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	}{
+		{
+			name: "connection refused",
+			dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, closedAddr)
+			},
+		},
+		{
+			name: "dns failure",
+			dial: func(_ context.Context, _, addr string) (net.Conn, error) {
+				return nil, &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: addr, IsNotFound: true}}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dials atomic.Int32
+			transport := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dials.Add(1)
+				return tt.dial(ctx, network, addr)
+			}}
+			c := New("http://api.example.test/graphql", "token", WithHTTPClient(&http.Client{Transport: transport, Timeout: 2 * time.Second}))
+
+			start := time.Now()
+			err := c.Execute(context.Background(), `mutation { approve(input: {id: "1"}) { id } }`, nil, nil)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if got := dials.Load(); got != 1 {
+				t.Fatalf("mutation was attempted %d times, want exactly 1", got)
+			}
+			if !strings.Contains(err.Error(), "mutation not sent") {
+				t.Errorf("error should say the mutation was not sent, got: %v", err)
+			}
+			if strings.Contains(err.Error(), "may have applied") {
+				t.Errorf("error must not claim an unsent mutation may have applied, got: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Errorf("no backoff should be spent on a mutation, took %s", elapsed)
+			}
+		})
+	}
+}
+
+func TestExecute_MutationNotSentOnRequestBuildFailure(t *testing.T) {
+	c := New("http://[::1/graphql", "token")
+	err := c.Execute(context.Background(), `mutation { approve(input: {id: "1"}) { id } }`, nil, nil)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "mutation not sent") || !strings.Contains(err.Error(), "creating request") {
+		t.Errorf("error should say the mutation was not sent, got: %v", err)
 	}
 }

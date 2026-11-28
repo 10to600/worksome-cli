@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -335,14 +336,10 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 		log.Printf("[graphql] --> POST %s\n%s", c.endpoint, string(payload))
 	}
 
-	// Only reads are retried. A mutation whose request failed without a
-	// response — a timeout, a dropped connection — may or may not have been
-	// applied: the server can have committed an approval or created a payment
-	// request and lost only the reply. Re-sending it is how an agent double-
-	// pays. Fail once, say so, and leave the retry decision to a caller who
-	// has re-read the record.
+	// A mutation that got no response may have been applied, so it is never retried.
+	isMutation := !isQuery(query)
 	attempts := maxRetries
-	if !isQuery(query) {
+	if isMutation {
 		attempts = 1
 	}
 
@@ -365,7 +362,10 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 			if errors.As(lastErr, &cve) {
 				return lastErr
 			}
-			if attempts == 1 {
+			if isMutation {
+				if requestNotSent(lastErr) {
+					return fmt.Errorf("mutation not sent (%w); the server never received it", lastErr)
+				}
 				return fmt.Errorf("mutation sent but no response received (%w); the server may have applied it — read the record before retrying", lastErr)
 			}
 			if c.verbose {
@@ -418,7 +418,23 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 		return nil
 	}
 
-	return fmt.Errorf("request failed after %d attempts: %w", attempts, lastErr)
+	return fmt.Errorf("request failed after %d attempts: %w", maxRetries, lastErr)
+}
+
+// errCreatingRequest marks a failure to build the HTTP request, before anything is sent.
+var errCreatingRequest = errors.New("creating request")
+
+// requestNotSent reports whether err happened before the request could reach the server.
+func requestNotSent(err error) bool {
+	if errors.Is(err, errCreatingRequest) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 // httpError is a non-retryable error indicating an unexpected HTTP status code.
@@ -487,7 +503,7 @@ func clientNameVersion(userAgent string) (name, version string) {
 func (c *Client) doRequest(ctx context.Context, payload []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("%w: %w", errCreatingRequest, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
